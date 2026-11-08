@@ -489,6 +489,10 @@ class DBOS:
         self._active_workflows_set: ActiveWorkflowById = ActiveWorkflowById(
             on_queue_slot_released=self._queue_wakeups.wake
         )
+        # Whether a newer application version has registered (read by the queue
+        # supervisor): a superseded generation polls queues with shared limits on its
+        # clock instead of on wake-ups, so it never dequeues in step with the newer one.
+        self._superseded: bool = False
         self._alert_handler: Optional[Callable[[str, str, Dict[str, str]], None]] = None
         serializer = config.get("serializer")
         self._serializer: Serializer = serializer if serializer else DefaultSerializer()
@@ -1077,6 +1081,9 @@ class DBOS:
             else:
                 dbos.logger.info("Registered new queue (not listening):")
             log_queue(queue)
+        # A queue registered after launch gets its worker thread now, not at the
+        # supervisor's next check.
+        dbos._queue_wakeups.supervisor.set()
         return queue
 
     @classmethod

@@ -250,9 +250,12 @@ def translate_dbos_config_to_config_file(config: DBOSConfig) -> ConfigFile:
     for key in ("internal_queue_polling_interval_sec", "queue_supervisor_interval_sec"):
         if key in config:
             interval_sec = config[key]
-            # Reject NaN/inf too, so the thread's wait can't crash.
+            # Reject a non-number and NaN/inf too, so the thread's wait can't crash.
             if interval_sec is not None and (
-                not math.isfinite(interval_sec) or interval_sec < 0.001
+                isinstance(interval_sec, bool)
+                or not isinstance(interval_sec, (int, float))
+                or not math.isfinite(interval_sec)
+                or interval_sec < 0.001
             ):
                 raise DBOSInitializationError(
                     f"{key} must be a finite number at least 0.001 seconds, got {interval_sec}"

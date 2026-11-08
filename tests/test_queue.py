@@ -46,6 +46,7 @@ from dbos._schemas.system_database import SystemSchema
 from dbos._sys_db import WorkflowStatusString
 from dbos._utils import INTERNAL_QUEUE_NAME, GlobalParams
 from tests.conftest import (
+    CrossLoopEvent,
     default_config,
     explain_with_index_scans_only,
     imprecise_timestamps,
@@ -1746,8 +1747,8 @@ async def test_timeout_queue_async(dbos: DBOS, config: DBOSConfig) -> None:
         "stuck_queue_async", concurrency=1, polling_interval_sec=0.1
     )
 
-    start_event = asyncio.Event()
-    blocking_event = asyncio.Event()
+    start_event = CrossLoopEvent()
+    blocking_event = CrossLoopEvent()
 
     @DBOS.workflow()
     async def stuck_workflow() -> None:
@@ -2129,7 +2130,7 @@ def test_queue_deduplication_recovery(dbos: DBOS) -> None:
 async def test_queue_deduplication_async(dbos: DBOS) -> None:
     queue_name = "test_dedup_queue_async"
     await DBOS.register_queue_async(queue_name)
-    workflow_event = asyncio.Event()
+    workflow_event = CrossLoopEvent()
 
     @DBOS.workflow()
     async def child_workflow(var1: str) -> str:
@@ -2262,7 +2263,7 @@ async def test_priority_queue_async(dbos: DBOS) -> None:
     await DBOS.register_queue_async("test_queue_priority_async", concurrency=1)
     await DBOS.register_queue_async("test_queue_child_async")
 
-    workflow_event = asyncio.Event()
+    workflow_event = CrossLoopEvent()
     wf_priority_list = []
 
     @DBOS.workflow()

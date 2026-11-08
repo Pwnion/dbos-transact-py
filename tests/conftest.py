@@ -470,6 +470,23 @@ def explain_with_index_scans_only(
     return [str(row[0]) for row in rows]
 
 
+class CrossLoopEvent:
+    """An event a test's coroutines and DBOS's workflows can share. An asyncio.Event
+    belongs to one event loop, and DBOS runs dequeued async workflows on its own
+    background loop: set from the test's loop, a workflow awaiting it on the other loop
+    is never woken. Tests passed with one only while a queue's polling delay meant the
+    event was set before the workflow first awaited it."""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def set(self) -> None:
+        self._event.set()
+
+    async def wait(self) -> None:
+        await asyncio.to_thread(self._event.wait)
+
+
 def retry_until_success(
     func: Callable[[], T], interval: float = 1, max_attempts: int = 10
 ) -> T:

@@ -1,7 +1,7 @@
 import hashlib
 import time
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Generator, List, Optional, cast
+from typing import Any, Callable, Dict, Generator, List, Optional, Tuple, cast
 
 import psycopg
 import sqlalchemy as sa
@@ -17,6 +17,7 @@ from dbos._migration import (
 )
 
 from ._datasource_migration import DATASOURCE_MIGRATIONS_TABLE
+from ._error import DBOSException
 from ._logger import dbos_logger
 from ._queue_wakeups import QUEUES_CHANNEL
 from ._schemas.system_database import SystemSchema
@@ -30,6 +31,17 @@ from ._utils import quote_identifier
 
 # Serializes migrations, and the queue wake triggers' install, across processes.
 MIGRATION_LOCK_ID = 1234567890
+
+# The queue wake-ups' triggers on workflow_status (insert, update, delete) and the marker
+# their function carries. Bump the marker with any change to the function or a trigger,
+# and launch reinstalls them.
+QUEUE_WAKE_TRIGGERS = (
+    "dbos_queue_wake_insert",
+    "dbos_queue_wake_update",
+    "dbos_queue_wake_delete",
+)
+QUEUE_WAKE_MARKER = "dbos queue wake-ups v1"
+QUEUE_WAKE_INSTALL_ATTEMPTS = 5
 
 
 def _sets_idle_transaction_timeout(url: sa.URL, engine_kwargs: Dict[str, Any]) -> bool:
@@ -151,69 +163,120 @@ class PostgresSystemDatabase(SystemDatabase):
                     )
         self._ensure_queue_wake_triggers()
 
-    def _ensure_queue_wake_triggers(self) -> None:
-        """Install the triggers that wake queue threads (QueueWakeups) when a workflow on a
-        queue becomes ENQUEUED (enqueued, recovered, resumed, a delay passed) or leaves
-        PENDING (completed, failed, cancelled, timed out: a slot is free).
-
-        Not a numbered migration: this fork's numbers would be taken by upstream's next
-        migrations. So it is checked at every launch that migrates and created only when
-        missing, under the migration advisory lock, since CREATE TRIGGER locks
-        workflow_status against writes. A new shape takes a new version suffix.
-        """
-        if not self.use_listen_notify:
-            return
+    def _queue_wake_sql(self) -> Tuple[str, str, Tuple[str, ...], str]:
+        """The queue wake-ups' table, function, triggers and the install SQL."""
         assert self.schema
         schema = quote_identifier(self.schema)
         table = f"{schema}.workflow_status"
-        function = f"{schema}.queue_wake_v1_function"
-        triggers = ("dbos_queue_wake_v1_insert", "dbos_queue_wake_v1_update")
-        present_sql = sa.text(
-            "SELECT count(*) FROM pg_trigger WHERE tgrelid = to_regclass(:table) AND tgname = ANY(:names)"
-        )
-        with self.engine.begin() as c:
-            present = c.execute(
-                present_sql, {"table": table, "names": list(triggers)}
-            ).scalar()
-        if present == len(triggers):
-            return
-        with self.engine.begin() as c:
-            c.execute(
-                sa.text("SELECT pg_advisory_xact_lock(:lock_id)"),
-                {"lock_id": MIGRATION_LOCK_ID},
-            )
-            present = c.execute(
-                present_sql, {"table": table, "names": list(triggers)}
-            ).scalar()
-            if present == len(triggers):
-                return
-            # COALESCE: cancelling, timing out and exhausting recovery clear queue_name.
-            c.execute(sa.text(f"""
+        function = f"{schema}.queue_wake_function"
+        insert, update, delete = QUEUE_WAKE_TRIGGERS
+        # Branch on TG_OP rather than combining tests: NEW is NULL in a DELETE trigger and
+        # OLD in an INSERT one, and SQL does not promise to short-circuit.
+        install = f"""
 CREATE OR REPLACE FUNCTION {function}() RETURNS TRIGGER AS $$
 BEGIN
-    PERFORM pg_notify('{QUEUES_CHANNEL}', COALESCE(NEW.queue_name, OLD.queue_name));
+    IF TG_OP <> 'DELETE' AND NEW.queue_name IS NOT NULL THEN
+        PERFORM pg_notify('{QUEUES_CHANNEL}', NEW.queue_name);
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        PERFORM pg_notify('{QUEUES_CHANNEL}', OLD.queue_name);
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF OLD.queue_name IS NOT NULL AND OLD.queue_name IS DISTINCT FROM NEW.queue_name THEN
+            PERFORM pg_notify('{QUEUES_CHANNEL}', OLD.queue_name);
+        END IF;
+    END IF;
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
 ALTER FUNCTION {function}() SET search_path = pg_catalog, pg_temp;
 
-DROP TRIGGER IF EXISTS {triggers[0]} ON {table};
-CREATE TRIGGER {triggers[0]}
+CREATE OR REPLACE TRIGGER {insert}
 AFTER INSERT ON {table}
 FOR EACH ROW WHEN (NEW.queue_name IS NOT NULL AND NEW.status = 'ENQUEUED')
 EXECUTE FUNCTION {function}();
 
-DROP TRIGGER IF EXISTS {triggers[1]} ON {table};
-CREATE TRIGGER {triggers[1]}
-AFTER UPDATE OF status ON {table}
+CREATE OR REPLACE TRIGGER {update}
+AFTER UPDATE OF status, queue_name ON {table}
 FOR EACH ROW WHEN (
-    COALESCE(NEW.queue_name, OLD.queue_name) IS NOT NULL
-    AND OLD.status IS DISTINCT FROM NEW.status
+    (NEW.queue_name IS NOT NULL OR OLD.queue_name IS NOT NULL)
     AND (NEW.status = 'ENQUEUED' OR OLD.status = 'PENDING')
+    AND (
+        OLD.status IS DISTINCT FROM NEW.status
+        OR OLD.queue_name IS DISTINCT FROM NEW.queue_name
+    )
 )
 EXECUTE FUNCTION {function}();
-"""))
+
+CREATE OR REPLACE TRIGGER {delete}
+AFTER DELETE ON {table}
+FOR EACH ROW WHEN (OLD.queue_name IS NOT NULL AND OLD.status = 'PENDING')
+EXECUTE FUNCTION {function}();
+
+COMMENT ON FUNCTION {function}() IS '{QUEUE_WAKE_MARKER}';
+"""
+        return table, function, QUEUE_WAKE_TRIGGERS, install
+
+    def _queue_wake_triggers_installed(self, c: sa.Connection) -> bool:
+        """Whether this version of the queue wake-ups is installed: every trigger, and
+        the function's marker, which a change to any of them bumps."""
+        table, function, triggers, _ = self._queue_wake_sql()
+        row = c.execute(
+            sa.text(
+                "SELECT (SELECT count(*) FROM pg_trigger WHERE tgrelid = to_regclass(:table) "
+                "AND tgname = ANY(:names)), "
+                "obj_description(to_regprocedure(:function), 'pg_proc')"
+            ),
+            {"table": table, "names": list(triggers), "function": f"{function}()"},
+        ).one()
+        return bool(row[0] == len(triggers) and row[1] == QUEUE_WAKE_MARKER)
+
+    def _ensure_queue_wake_triggers(self) -> None:
+        """Install the triggers that wake queue threads (QueueWakeups) when a row on a queue
+        becomes ENQUEUED (enqueued, recovered, resumed, moved between queues, a delay
+        passed) or leaves PENDING (completed, failed, cancelled, timed out, deleted: a
+        slot is free), naming both queues when a row moves between them.
+
+        Not a numbered migration: this fork's numbers would be taken by upstream's next
+        migrations, and an upgrade would skip them. So every launch that migrates checks
+        for them and installs them only when missing or of an older marker. CREATE OR
+        REPLACE TRIGGER (PostgreSQL 14+) takes SHARE ROW EXCLUSIVE, which waits behind any
+        open write to workflow_status and holds back every write after it, so the install
+        gives up on the lock after a few seconds and tries again, and gives up for good
+        (failing launch) rather than stall the table.
+        """
+        if not self.use_listen_notify:
+            return
+        with self.engine.begin() as c:
+            if self._queue_wake_triggers_installed(c):
+                return
+        _, _, _, install = self._queue_wake_sql()
+        for attempt in range(QUEUE_WAKE_INSTALL_ATTEMPTS):
+            try:
+                with self.engine.begin() as c:
+                    # Serialized with migrations and every other process's install.
+                    locked = c.execute(
+                        sa.text("SELECT pg_try_advisory_xact_lock(:lock_id)"),
+                        {"lock_id": MIGRATION_LOCK_ID},
+                    ).scalar()
+                    if locked:
+                        if self._queue_wake_triggers_installed(c):
+                            return
+                        c.execute(sa.text("SET LOCAL lock_timeout = '5s'"))
+                        c.execute(sa.text(install))
+                        return
+            except DBAPIError as e:
+                if not isinstance(e.orig, psycopg.errors.LockNotAvailable):
+                    raise
+            dbos_logger.warning(
+                f"Queue wake-up triggers not installed yet (attempt {attempt + 1}): "
+                "workflow_status or the migration lock is busy."
+            )
+            time.sleep(1 + attempt)
+        raise DBOSException(
+            "Could not install the queue wake-up triggers: workflow_status stayed locked. "
+            "Without them every queue waits for its polling interval."
+        )
 
     def verify_migrations(self) -> None:
         """Check the system database is migrated, creating and changing nothing."""
@@ -222,6 +285,14 @@ EXECUTE FUNCTION {function}();
             self.engine, self.schema, self.use_listen_notify
         )
         self._assert_migration_version(current_version, latest_version)
+        if self.use_listen_notify:
+            with self.engine.begin() as c:
+                if not self._queue_wake_triggers_installed(c):
+                    dbos_logger.warning(
+                        "The queue wake-up triggers are missing or out of date, and this "
+                        "process does not migrate: every queue waits for its polling "
+                        "interval until a process that migrates launches."
+                    )
 
     @contextmanager
     def retention_lock(self) -> Generator[bool, None, None]:

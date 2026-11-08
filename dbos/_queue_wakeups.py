@@ -11,15 +11,19 @@ class QueueWakeups:
     Each queue's worker thread waits on its queue's event, bounded by the queue's polling
     interval, which is then only a backstop. The event is set by whatever can make a
     queued workflow runnable: a NOTIFY from the system database's queue triggers (a
-    workflow enqueued, or a queued workflow leaving PENDING, which frees a slot), the
+    workflow enqueued, moved to the queue, or leaving PENDING, which frees a slot), the
     notification listener reconnecting (a NOTIFY sent while it was down is lost), and
     this process releasing one of its own workflows' slots (the in-memory running count
     a dequeue reads can lag the NOTIFY of the same workflow's completion).
+
+    ``supervisor`` wakes the queue supervisor, so a queue registered after launch gets
+    its worker thread at once rather than at the supervisor's next check.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._events: dict[str, threading.Event] = {}
+        self.supervisor = threading.Event()
 
     def event(self, queue_name: str) -> threading.Event:
         """The queue's event, created set, so a newly started worker thread polls at once."""
@@ -40,7 +44,9 @@ class QueueWakeups:
             event.set()
 
     def wake_all(self) -> None:
+        """Wake every queue's worker thread and the supervisor."""
         with self._lock:
             events = list(self._events.values())
         for event in events:
             event.set()
+        self.supervisor.set()

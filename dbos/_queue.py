@@ -664,14 +664,35 @@ class Queue:
         )
 
 
+# How soon a poll that failed, or skipped a partition, is tried again: its wake-up was
+# spent on it, so without this the work it was for would wait for the backstop.
+_RETRY_AFTER_FAILED_POLL_SEC = 1.0
+
+
+def _limits_shared_across_workers(queue: Queue) -> bool:
+    """Whether the queue has a limit every worker's dequeue counts against together."""
+    return any(
+        limit is not None
+        for limit in (
+            queue._concurrency,
+            queue._partition_concurrency,
+            queue._limiter,
+            queue._partition_limiter,
+        )
+    )
+
+
 def queue_worker_thread(
     stop_event: threading.Event, dbos: "DBOS", queue: Queue
 ) -> None:
     """Worker thread for processing a single queue."""
     polling_interval = queue._polling_interval_sec
     # Set by whatever can make this queue's work runnable (QueueWakeups); the polling
-    # interval bounds the wait, so a lost wake-up costs at most one interval.
+    # interval bounds the wait, so a lost wake-up costs at most one interval. Set here
+    # too, so a restarted thread polls at once although its predecessor cleared it.
     wakeup = dbos._queue_wakeups.event(queue.name)
+    wakeup.set()
+    retry_after: Optional[float] = None
 
     def start_dequeued_workflows(workflow_ids: List[str], owner_xid: str) -> None:
         """Fetch the claimed workflows' statuses in one round trip, then dispatch each."""
@@ -705,9 +726,36 @@ def queue_worker_thread(
         return max(0, q._worker_concurrency - running)
 
     while not stop_event.is_set():
-        # Reload database-backed queue config once per iteration so dynamic
-        # changes (concurrency, polling interval, etc.) take effect without
-        # a restart. If the row was deleted, exit the worker.
+        min_polling_interval = queue._polling_interval_sec
+        max_polling_interval = max(queue._polling_interval_sec, 120.0)
+        polling_interval = max(
+            min_polling_interval, min(polling_interval, max_polling_interval)
+        )
+        timeout = polling_interval * random.uniform(0.95, 1.05)
+        if queue._limiter is not None or queue._partition_limiter is not None:
+            # A rate limit's window opens with no row changing, so no NOTIFY announces it.
+            timeout = min(timeout, DEFAULT_QUEUE_POLLING_INTERVAL_SEC)
+        if retry_after is not None:
+            timeout = min(timeout, retry_after)
+
+        if dbos._superseded and _limits_shared_across_workers(queue):
+            # A newer generation counts against this queue's limits too, and one NOTIFY
+            # wakes both at once, so their dequeues would meet inside the window where
+            # each counts the other's claims as not yet made, and together pass the
+            # limit. A superseded generation polls these on its clock, as upstream does.
+            stop_event.wait(timeout=min(timeout, DEFAULT_QUEUE_POLLING_INTERVAL_SEC))
+        else:
+            wakeup.wait(timeout=timeout)
+        if stop_event.is_set():
+            return
+        # Cleared before the poll, never after it: a wake-up that arrives during the poll
+        # makes the next wait return at once, so the work it announced is never left for
+        # the backstop.
+        wakeup.clear()
+        retry_after = None
+
+        # Reload database-backed queue config after the wait, so the poll a wake-up
+        # starts uses the queue's current limits. If the row was deleted, exit the worker.
         if queue.database_backed_queue:
             try:
                 latest = dbos._sys_db.get_queue(queue.name)
@@ -722,20 +770,8 @@ def queue_worker_thread(
                 )
                 return
             queue = latest
-
-        min_polling_interval = queue._polling_interval_sec
-        max_polling_interval = max(queue._polling_interval_sec, 120.0)
-        polling_interval = max(
-            min_polling_interval, min(polling_interval, max_polling_interval)
-        )
-
-        # Wait until woken, or for the polling interval with jitter. Cleared before the
-        # poll, never after it: a wake-up that arrives during the poll makes the next
-        # wait return at once, so the work it announced is never left for the backstop.
-        wakeup.wait(timeout=polling_interval * random.uniform(0.95, 1.05))
-        if stop_event.is_set():
-            return
-        wakeup.clear()
+            min_polling_interval = queue._polling_interval_sec
+            max_polling_interval = max(queue._polling_interval_sec, 120.0)
 
         try:
             if not queue._has_partition_limits():
@@ -800,11 +836,13 @@ def queue_worker_thread(
                             e.orig,
                             (errors.LockNotAvailable, errors.SerializationFailure),
                         ):
+                            retry_after = _RETRY_AFTER_FAILED_POLL_SEC
                             continue
                         raise
                     claimed += len(dequeued_workflows)
                     start_dequeued_workflows(dequeued_workflows, owner_xid)
         except OperationalError as e:
+            retry_after = _RETRY_AFTER_FAILED_POLL_SEC
             if isinstance(e.orig, errors.LockNotAvailable):
                 # Another worker is dequeueing this queue right now; retry next
                 # poll without backing off.
@@ -825,6 +863,7 @@ def queue_worker_thread(
                     f"Exception encountered in queue thread for {queue.name}: {e}"
                 )
         except Exception as e:
+            retry_after = _RETRY_AFTER_FAILED_POLL_SEC
             if not stop_event.is_set():
                 # Only print the error if the thread is not stopping
                 dbos.logger.warning(
@@ -872,6 +911,18 @@ def queue_thread(stop_event: threading.Event, dbos: "DBOS") -> None:
         except Exception as e:
             dbos.logger.warning(f"Exception transitioning delayed workflows: {e}")
 
+        # Whether a newer application version has registered: a superseded generation
+        # polls the queues whose limits are shared on its clock (queue_worker_thread).
+        try:
+            latest_version = dbos._sys_db.get_latest_application_version()
+            dbos._superseded = (
+                latest_version["version_name"] != GlobalParams.app_version
+            )
+        except Exception as e:
+            dbos.logger.warning(
+                f"Exception reading the latest application version: {e}"
+            )
+
         # Start threads for new queues
         for queue_name, queue in current_queues.items():
             if (
@@ -888,9 +939,13 @@ def queue_thread(stop_event: threading.Event, dbos: "DBOS") -> None:
                 queue_threads[queue_name] = thread
                 dbos.logger.debug(f"Started worker thread for queue: {queue_name}")
 
-        # Wait for the check interval or stop event
-        if stop_event.wait(timeout=check_interval):
+        # Wait for the check interval, a queue registered after launch, or the stop event
+        # (each of the last two sets the supervisor's wake-up).
+        supervisor = dbos._queue_wakeups.supervisor
+        supervisor.wait(timeout=check_interval)
+        if stop_event.is_set():
             break
+        supervisor.clear()
 
     # Join all queue worker threads
     dbos.logger.info("Stopping queue manager, joining all worker threads...")
