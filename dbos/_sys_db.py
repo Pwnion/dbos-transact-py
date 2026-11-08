@@ -71,6 +71,7 @@ from ._error import (
 )
 from ._logger import dbos_logger
 from ._outcome import NoResult
+from ._queue_wakeups import QueueWakeups
 from ._schemas import SCHEMA_PLACEHOLDER
 from ._schemas.system_database import SystemSchema
 from ._serialization import (
@@ -444,6 +445,7 @@ _dbos_stream_closed_sentinel = "__DBOS_STREAM_CLOSED__"
 _dbos_notifications_channel = "dbos_notifications_channel"
 _dbos_workflow_events_channel = "dbos_workflow_events_channel"
 _dbos_streams_channel = "dbos_streams_channel"
+# The queues channel (QUEUES_CHANNEL, dbos._queue_wakeups) fires from in-transaction triggers on workflow_status, so a queue is never woken before the row that makes its work runnable commits.
 
 # Returned by read_stream_value when nothing is written at the requested offset. Not None, which is itself a valid stream value.
 _no_stream_value = object()
@@ -801,6 +803,10 @@ class SystemDatabase(ABC):
 
         self._listener_thread_lock = threading.Lock()
         self._listener_running = False
+
+        # Set by an executing DBOS (never a client): the queue wake-ups its notification
+        # listener sets from the queues channel (QueueWakeups).
+        self.queue_wakeups: Optional[QueueWakeups] = None
 
         # Per-(queue, partition key) created_at cursors: keep per-key queue order monotonic across batches
         self._batch_created_at_lock = threading.Lock()

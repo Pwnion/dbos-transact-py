@@ -92,9 +92,10 @@ def postgres_urls() -> Tuple[str, str]:
     """The (user, system) PostgreSQL URLs shared by every test. The first is a
     plain user database, for tests that attach a datasource to one."""
     password = quote(os.environ.get("PGPASSWORD", "dbos"), safe="")
+    user = quote(os.environ.get("PGUSER", "postgres"), safe="")
     return (
-        f"postgresql://postgres:{password}@localhost:5432/dbostestpy",
-        f"postgresql+psycopg://postgres:{password}@localhost:5432/dbostestpy_dbos_sys",
+        f"postgresql://{user}:{password}@localhost:5432/dbostestpy",
+        f"postgresql+psycopg://{user}:{password}@localhost:5432/dbostestpy_dbos_sys",
     )
 
 

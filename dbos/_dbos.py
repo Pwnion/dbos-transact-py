@@ -88,6 +88,7 @@ from ._queue import (
     log_queue,
     queue_thread,
 )
+from ._queue_wakeups import QueueWakeups
 from ._recovery import recover_pending_workflows, startup_recovery_thread
 from ._registrations import (
     DEFAULT_MAX_RECOVERY_ATTEMPTS,
@@ -482,7 +483,12 @@ class DBOS:
         self.enable_patching = config.get("enable_patching") == True
         self.conductor_websocket: Optional[ConductorWebsocket] = None
         self._background_event_loop: BackgroundEventLoop = BackgroundEventLoop()
-        self._active_workflows_set: ActiveWorkflowById = ActiveWorkflowById()
+        # Per-queue wake-ups (QueueWakeups): a queue's worker thread sleeps until there may
+        # be work, and this process freeing one of its slots is one of the things that wakes it.
+        self._queue_wakeups: QueueWakeups = QueueWakeups()
+        self._active_workflows_set: ActiveWorkflowById = ActiveWorkflowById(
+            on_queue_slot_released=self._queue_wakeups.wake
+        )
         self._alert_handler: Optional[Callable[[str, str, Dict[str, str]], None]] = None
         serializer = config.get("serializer")
         self._serializer: Serializer = serializer if serializer else DefaultSerializer()
@@ -531,6 +537,10 @@ class DBOS:
         self._registry.kafka_queue_polling_interval_sec = self._config.get(
             "runtimeConfig", {}
         ).get("kafka_queue_polling_interval_sec")
+        self._queue_supervisor_interval_sec: float = (
+            self._config.get("runtimeConfig", {}).get("queue_supervisor_interval_sec")
+            or 1.0
+        )
 
         config_logger(self._config)
         dbos_tracer.config(self._config)
@@ -668,6 +678,9 @@ class DBOS:
                 ),
             )
 
+            # The notification listener wakes this process's queue threads (QueueWakeups).
+            self._sys_db_field.queue_wakeups = self._queue_wakeups
+
             # Run migrations for the system database
             if self._config.get("run_migrations", True):
                 dbos_logger.debug("Running system database migrations")
@@ -729,7 +742,13 @@ class DBOS:
             self._background_threads.append(notifier_thread)
 
             # Create the internal queue if it has not yet been created
-            self._registry.get_internal_queue()
+            internal_queue = self._registry.get_internal_queue()
+            internal_interval = self._config.get("runtimeConfig", {}).get(
+                "internal_queue_polling_interval_sec"
+            )
+            if internal_interval is not None:
+                # In memory, and the queue thread has not started: assign directly.
+                internal_queue._polling_interval_sec = internal_interval
 
             # Start the queue thread
             dbos_logger.debug("Starting queue thread")
@@ -901,6 +920,8 @@ class DBOS:
         self._initialized = False
         for event in self.background_thread_stop_events:
             event.set()
+        # Queue worker threads sleep on their wake-ups, not the stop event: wake them to stop.
+        self._queue_wakeups.wake_all()
         if workflow_completion_timeout_sec > 0:
             deadline = time.time() + workflow_completion_timeout_sec
             while time.time() < deadline:

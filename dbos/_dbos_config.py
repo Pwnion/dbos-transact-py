@@ -48,6 +48,8 @@ class DBOSConfig(TypedDict, total=False):
         observability_query_timeout_sec (float): Statement timeout, in seconds, for read-only observability queries against the system database. Defaults to 30.0.
         scheduler_polling_interval_sec (float): Polling interval in seconds for the scheduler thread to detect new workflow schedules. Defaults to 30.0.
         kafka_queue_polling_interval_sec (float): Polling interval in seconds for the internal queues on which Kafka consumer workflows run (_dbos_kafka_queue and _dbos_kafka_ordered_queue). Defaults to 1.0. Minimum value is 0.001.
+        internal_queue_polling_interval_sec (float): Polling interval in seconds for the internal queue (_dbos_internal_queue). Defaults to 1.0. Minimum value is 0.001. With LISTEN/NOTIFY a queue is woken when work arrives, so this is a backstop.
+        queue_supervisor_interval_sec (float): How often, in seconds, the queue supervisor looks for newly registered queues, restarts a stopped queue thread and promotes DELAYED workflows whose delay has passed. Defaults to 1.0. Minimum value is 0.001.
         otel_attribute_format (Literal["legacy", "semconv"]): How span attribute names are emitted to OTLP.
             "legacy" (default) keeps DBOS's original names (e.g. operationUUID, applicationID) for backward
             compatibility with existing dashboards and the TypeScript Transact SDK. "semconv" emits the
@@ -86,6 +88,8 @@ class DBOSConfig(TypedDict, total=False):
     observability_query_timeout_sec: Optional[float]
     scheduler_polling_interval_sec: Optional[float]
     kafka_queue_polling_interval_sec: Optional[float]
+    internal_queue_polling_interval_sec: Optional[float]
+    queue_supervisor_interval_sec: Optional[float]
     otel_attribute_format: Optional[Literal["legacy", "semconv"]]
 
 
@@ -98,6 +102,8 @@ class RuntimeConfig(TypedDict, total=False):
     observability_query_timeout_sec: Optional[float]
     scheduler_polling_interval_sec: Optional[float]
     kafka_queue_polling_interval_sec: Optional[float]
+    internal_queue_polling_interval_sec: Optional[float]
+    queue_supervisor_interval_sec: Optional[float]
 
 
 class DatabaseConfig(TypedDict, total=False):
@@ -241,6 +247,17 @@ def translate_dbos_config_to_config_file(config: DBOSConfig) -> ConfigFile:
         translated_config["runtimeConfig"]["scheduler_polling_interval_sec"] = config[
             "scheduler_polling_interval_sec"
         ]
+    for key in ("internal_queue_polling_interval_sec", "queue_supervisor_interval_sec"):
+        if key in config:
+            interval_sec = config[key]
+            # Reject NaN/inf too, so the thread's wait can't crash.
+            if interval_sec is not None and (
+                not math.isfinite(interval_sec) or interval_sec < 0.001
+            ):
+                raise DBOSInitializationError(
+                    f"{key} must be a finite number at least 0.001 seconds, got {interval_sec}"
+                )
+            translated_config["runtimeConfig"][key] = interval_sec
     if "kafka_queue_polling_interval_sec" in config:
         kafka_interval = config["kafka_queue_polling_interval_sec"]
         # Reject NaN/inf too (they slip past a bare < 0.001) so the queue worker's wait can't crash.

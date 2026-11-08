@@ -669,6 +669,9 @@ def queue_worker_thread(
 ) -> None:
     """Worker thread for processing a single queue."""
     polling_interval = queue._polling_interval_sec
+    # Set by whatever can make this queue's work runnable (QueueWakeups); the polling
+    # interval bounds the wait, so a lost wake-up costs at most one interval.
+    wakeup = dbos._queue_wakeups.event(queue.name)
 
     def start_dequeued_workflows(workflow_ids: List[str], owner_xid: str) -> None:
         """Fetch the claimed workflows' statuses in one round trip, then dispatch each."""
@@ -726,9 +729,13 @@ def queue_worker_thread(
             min_polling_interval, min(polling_interval, max_polling_interval)
         )
 
-        # Wait for the polling interval with jitter
-        if stop_event.wait(timeout=polling_interval * random.uniform(0.95, 1.05)):
+        # Wait until woken, or for the polling interval with jitter. Cleared before the
+        # poll, never after it: a wake-up that arrives during the poll makes the next
+        # wait return at once, so the work it announced is never left for the backstop.
+        wakeup.wait(timeout=polling_interval * random.uniform(0.95, 1.05))
+        if stop_event.is_set():
             return
+        wakeup.clear()
 
         try:
             if not queue._has_partition_limits():
@@ -831,8 +838,9 @@ def queue_worker_thread(
 def queue_thread(stop_event: threading.Event, dbos: "DBOS") -> None:
     """Main queue manager thread that spawns and monitors worker threads for each queue."""
     queue_threads: dict[str, threading.Thread] = {}
-    # Check interval for monitoring queue registration changes
-    check_interval = 1.0
+    # Check interval for monitoring queue registration changes and promoting DELAYED
+    # workflows (``queue_supervisor_interval_sec``, default 1 s).
+    check_interval = dbos._queue_supervisor_interval_sec
 
     log_queues(dbos, dbos._listening_queues)
 

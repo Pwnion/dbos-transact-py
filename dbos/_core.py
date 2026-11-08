@@ -927,10 +927,15 @@ class ActiveWorkflowById:
     releases its entry first, or it would hold a worker slot the re-dispatch needs.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, on_queue_slot_released: Optional[Callable[[str], None]] = None
+    ) -> None:
         self._lock = threading.Lock()
         # One queue bucket (queue_name, queue_partition_key) per running execution of the ID.
         self._m: dict[str, List[QueueBucket]] = {}
+        # Called with the queue's name once a queued execution's slot is free here, so
+        # the queue's worker thread can dequeue what waited for it (QueueWakeups).
+        self._on_queue_slot_released = on_queue_slot_released
 
     def add(
         self,
@@ -952,6 +957,9 @@ class ActiveWorkflowById:
             buckets.remove(bucket)
             if not buckets:
                 del self._m[key]
+        # After the lock: the woken thread's dequeue counts this registry.
+        if bucket is not None and self._on_queue_slot_released is not None:
+            self._on_queue_slot_released(bucket[0])
 
     def activeList(self) -> List[str]:
         with self._lock:

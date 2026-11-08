@@ -1,6 +1,8 @@
 [project]
 name = "dbos"
-dynamic = ["version"]
+# Pyron fork: a static version, since the fork is installed from a GitHub
+# archive, which carries no git metadata for the scm version source.
+version = "3.2.0+pyron.1"
 description = "Ultra-lightweight durable execution in Python"
 authors = [
     {name = "DBOS, Inc.", email = "contact@dbos.dev"},
@@ -64,10 +66,6 @@ distribution = true
 # version/ is the build-time version hook, so it belongs in the sdist only.
 includes = ["dbos/"]
 source-includes = ["tests/", "version/"]
-
-[tool.pdm.version]
-source = "scm"
-version_format = "version:format_version"
 
 [tool.black]
 line-length = 88

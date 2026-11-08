@@ -18,6 +18,7 @@ from dbos._migration import (
 
 from ._datasource_migration import DATASOURCE_MIGRATIONS_TABLE
 from ._logger import dbos_logger
+from ._queue_wakeups import QUEUES_CHANNEL
 from ._schemas.system_database import SystemSchema
 from ._sys_db import (
     SystemDatabase,
@@ -26,6 +27,9 @@ from ._sys_db import (
     _dbos_workflow_events_channel,
 )
 from ._utils import quote_identifier
+
+# Serializes migrations, and the queue wake triggers' install, across processes.
+MIGRATION_LOCK_ID = 1234567890
 
 
 def _sets_idle_transaction_timeout(url: sa.URL, engine_kwargs: Dict[str, Any]) -> bool:
@@ -105,13 +109,13 @@ class PostgresSystemDatabase(SystemDatabase):
         # Skip the advisory lock and migration work entirely if the schema
         # and dbos_migrations table already exist and are at the latest version.
         if not should_migrate(self.engine, self.schema, self.use_listen_notify):
+            self._ensure_queue_wake_triggers()
             return
 
         # Use an advisory lock to serialize concurrent migrations.
         # Try to acquire the lock for up to 30 seconds. If we can't, log a
         # warning and proceed to run migrations without it, rather than
         # hanging startup indefinitely.
-        MIGRATION_LOCK_ID = 1234567890
         MIGRATION_LOCK_TIMEOUT_SEC = 30
         locked = False
         # Use AUTOCOMMIT so the lock connection does not sit idle-in-transaction
@@ -145,6 +149,71 @@ class PostgresSystemDatabase(SystemDatabase):
                         sa.text("SELECT pg_advisory_unlock(:lock_id)"),
                         {"lock_id": MIGRATION_LOCK_ID},
                     )
+        self._ensure_queue_wake_triggers()
+
+    def _ensure_queue_wake_triggers(self) -> None:
+        """Install the triggers that wake queue threads (QueueWakeups) when a workflow on a
+        queue becomes ENQUEUED (enqueued, recovered, resumed, a delay passed) or leaves
+        PENDING (completed, failed, cancelled, timed out: a slot is free).
+
+        Not a numbered migration: this fork's numbers would be taken by upstream's next
+        migrations. So it is checked at every launch that migrates and created only when
+        missing, under the migration advisory lock, since CREATE TRIGGER locks
+        workflow_status against writes. A new shape takes a new version suffix.
+        """
+        if not self.use_listen_notify:
+            return
+        assert self.schema
+        schema = quote_identifier(self.schema)
+        table = f"{schema}.workflow_status"
+        function = f"{schema}.queue_wake_v1_function"
+        triggers = ("dbos_queue_wake_v1_insert", "dbos_queue_wake_v1_update")
+        present_sql = sa.text(
+            "SELECT count(*) FROM pg_trigger WHERE tgrelid = to_regclass(:table) AND tgname = ANY(:names)"
+        )
+        with self.engine.begin() as c:
+            present = c.execute(
+                present_sql, {"table": table, "names": list(triggers)}
+            ).scalar()
+        if present == len(triggers):
+            return
+        with self.engine.begin() as c:
+            c.execute(
+                sa.text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": MIGRATION_LOCK_ID},
+            )
+            present = c.execute(
+                present_sql, {"table": table, "names": list(triggers)}
+            ).scalar()
+            if present == len(triggers):
+                return
+            # COALESCE: cancelling, timing out and exhausting recovery clear queue_name.
+            c.execute(sa.text(f"""
+CREATE OR REPLACE FUNCTION {function}() RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM pg_notify('{QUEUES_CHANNEL}', COALESCE(NEW.queue_name, OLD.queue_name));
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+ALTER FUNCTION {function}() SET search_path = pg_catalog, pg_temp;
+
+DROP TRIGGER IF EXISTS {triggers[0]} ON {table};
+CREATE TRIGGER {triggers[0]}
+AFTER INSERT ON {table}
+FOR EACH ROW WHEN (NEW.queue_name IS NOT NULL AND NEW.status = 'ENQUEUED')
+EXECUTE FUNCTION {function}();
+
+DROP TRIGGER IF EXISTS {triggers[1]} ON {table};
+CREATE TRIGGER {triggers[1]}
+AFTER UPDATE OF status ON {table}
+FOR EACH ROW WHEN (
+    COALESCE(NEW.queue_name, OLD.queue_name) IS NOT NULL
+    AND OLD.status IS DISTINCT FROM NEW.status
+    AND (NEW.status = 'ENQUEUED' OR OLD.status = 'PENDING')
+)
+EXECUTE FUNCTION {function}();
+"""))
 
     def verify_migrations(self) -> None:
         """Check the system database is migrated, creating and changing nothing."""
@@ -412,6 +481,11 @@ class PostgresSystemDatabase(SystemDatabase):
                     psycopg_conn.execute(f"LISTEN {_dbos_notifications_channel}")
                     psycopg_conn.execute(f"LISTEN {_dbos_workflow_events_channel}")
                     psycopg_conn.execute(f"LISTEN {_dbos_streams_channel}")
+                    if self.queue_wakeups is not None:
+                        psycopg_conn.execute(f"LISTEN {QUEUES_CHANNEL}")
+                if self.queue_wakeups is not None:
+                    # A NOTIFY sent while this connection was down is lost: poll every queue once.
+                    self.queue_wakeups.wake_all()
                 while self._run_background_processes:
                     gen = psycopg_conn.notifies()
                     for notify in gen:
@@ -446,6 +520,9 @@ class PostgresSystemDatabase(SystemDatabase):
                                 dbos_logger.debug(
                                     f"Signaled streams event for {notify.payload}"
                                 )
+                        elif channel == QUEUES_CHANNEL:
+                            if notify.payload and self.queue_wakeups is not None:
+                                self.queue_wakeups.wake(notify.payload)
                         else:
                             dbos_logger.error(f"Unknown channel: {channel}")
             except Exception as e:
